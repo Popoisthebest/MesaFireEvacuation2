@@ -5,7 +5,6 @@ import networkx as nx
 import numpy as np
 from enum import IntEnum
 from mesa import Agent
-from copy import deepcopy
 
 from fire_evacuation.utils import get_random_id
 
@@ -105,6 +104,19 @@ class Sight(FloorObject):
 
     def get_position(self):
         return self.pos
+
+
+class GuideSignal(FloorObject):
+    def __init__(self, pos, model):
+        super().__init__(
+            pos, traversable=True, flammable=False, spreads_smoke=False, visibility=3, model=model
+        )
+        self.direction = "•"
+        self.local_risk = 0.0
+
+    def update_signal(self, direction: str, local_risk: float):
+        self.direction = direction
+        self.local_risk = local_risk
 
 
 class Door(FloorObject):
@@ -363,6 +375,11 @@ class Human(Agent):
 
         # A set representing where the agent has been already
         self.visited_tiles: set[Coordinate] = {self.pos}
+        self.path_change_count: int = 0
+        self.last_path: list[Coordinate] = []
+        self.last_replan_step: int = -1
+        self.smoke_exposure: float = 0.0
+        self.evacuation_time: Union[int, None] = None
 
     def update_sight_tiles(self, visible_neighborhood):
         if len(self.visible_tiles) > 0:
@@ -464,18 +481,22 @@ class Human(Agent):
                     fire_exits.add((agent, pos))
 
         if len(fire_exits) > 0:
-            if len(fire_exits) > 1:  # If there is more than one exit known
-                best_distance = None
-                for exit, exit_pos in fire_exits:
-                    length = len(
-                        get_line(self.pos, exit_pos)
-                    )  # Let's use Bresenham's to find the 'closest' exit
-                    if not best_distance or length < best_distance:
-                        best_distance = length
-                        self.planned_target = (exit, exit_pos)
+            best_score = None
+            best_target = None
+            for fire_exit, exit_pos in fire_exits:
+                path = self.get_path(self.model.graph, exit_pos)
+                if not path:
+                    continue
+                path_risk = sum(self.model.get_cell_risk(p) for p in path)
+                estimated_time = max(1, len(path)) / max(self.speed, 0.1)
+                exit_congestion = self.model.exit_congestion_map.get(exit_pos, 0)
+                score = (1.0 * path_risk) + (0.7 * estimated_time) + (1.2 * exit_congestion)
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_target = (fire_exit, exit_pos)
 
-            else:
-                self.planned_target = fire_exits.pop()
+            if best_target:
+                self.planned_target = best_target
 
             # print("Agent found a fire escape!", self.planned_target)
         else:  # If there's a fire and no fire-escape in sight, try to head for an unvisited door, if no door in sight, move randomly (for now)
@@ -493,6 +514,9 @@ class Human(Agent):
             # Still didn't find a planned_target, so get a random unvisited target
             if not self.planned_target[1]:
                 self.get_random_target(allow_visited=False)
+
+        self.last_replan_step = self.model.schedule.steps
+        return self.planned_target
 
     def get_panic_score(self):
         health_component = 1 / np.exp(self.health / self.nervousness)
@@ -716,24 +740,16 @@ class Human(Agent):
             return (next_location, next_path)
         except Exception as e:
             raise Exception(
-                f"Failed to get next location: {e}\nPath: {path},\nlen: {length},\nSpeed: {self.speed}"
+                f"Failed to get next location: {e}\nPath: {path},\nlen: {path_length},\nSpeed: {self.speed}"
             )
 
     def get_path(self, graph, target, include_target=True) -> list[Coordinate]:
         path = []
-        visible_tiles_pos = [pos for pos, _ in self.visible_tiles]
 
         try:
-            if target in visible_tiles_pos:  # Target is visible, so simply take the shortest path
-                path = nx.shortest_path(graph, self.pos, target)
-            else:  # Target is not visible, so do less efficient pathing
-                # TODO: In the future this could be replaced with a more naive path algorithm
-                path = nx.shortest_path(graph, self.pos, target)
-
-                if not include_target:
-                    del path[
-                        -1
-                    ]  # We don't want the target included in the path, so delete the last element
+            path = nx.shortest_path(graph, self.pos, target, weight="weight")
+            if not include_target and path:
+                del path[-1]
 
             return list(path)
         except nx.exception.NodeNotFound as e:
@@ -774,6 +790,12 @@ class Human(Agent):
         return retreat_location
 
     def check_retreat(self, next_path, next_location) -> bool:
+        immediate_neighbors = self.model.grid.get_neighborhood(
+            self.pos, moore=True, include_center=True, radius=1
+        )
+        immediate_contents = self.model.grid.get_cell_list_contents(immediate_neighbors)
+        immediate_fire = any(isinstance(agent, Fire) for agent in immediate_contents)
+
         # Get the contents of any visible locations in the next path
         visible_path = []
         for visible_pos, _ in self.visible_tiles:
@@ -782,7 +804,7 @@ class Human(Agent):
 
         visible_contents = self.model.grid.get_cell_list_contents(visible_path)
         for agent in visible_contents:
-            if (isinstance(agent, Smoke) and not self.planned_action) or isinstance(agent, Fire):
+            if immediate_fire and ((isinstance(agent, Smoke) and not self.planned_action) or isinstance(agent, Fire)):
                 # There's a danger in the visible path, so try and retreat in the opposite direction
                 # Retreat if there's fire, or smoke (and no collaboration attempt)
                 retreat_location = self.get_retreat_location(next_location)
@@ -831,22 +853,45 @@ class Human(Agent):
                 planned_agent.get_mobility() != Human.Mobility.PANIC
                 or not planned_agent.get_status() == Human.Status.ALIVE
             ):
-                # print("Target agent no longer panicking. Dropping action.")
                 self.planned_target = (None, None)
                 self.planned_action = None
-            # Agent had planned physical collaboration, but the agent is no longer incapacitated or has already been carried or is not alive, so drop it.
         elif self.planned_action == Human.Action.PHYSICAL_SUPPORT and (
-            (planned_agent.get_mobility() != Human.Mobility.INCAPACITATED)
+            planned_agent is None
+            or (planned_agent.get_mobility() != Human.Mobility.INCAPACITATED)
             or planned_agent.is_carried()
             or planned_agent.get_status() != Human.Status.ALIVE
         ):
-            self.planned_target = (None, None)
-            self.planned_action = None
+                self.planned_target = (None, None)
+                self.planned_action = None
         elif self.planned_action == Human.Action.RETREAT:
             return
         else:  # Can no longer perform the action
             self.planned_target = (None, None)
             self.planned_action = None
+
+    def should_replan(self, current_path: list[Coordinate]) -> bool:
+        if self.model.guidance_mode == "static":
+            return self.last_replan_step < 0
+
+        step = self.model.schedule.steps
+        if self.last_replan_step < 0:
+            return True
+        if step - self.last_replan_step >= self.model.replan_interval:
+            return True
+
+        if not current_path:
+            return True
+
+        for pos in current_path:
+            contents = self.model.grid.get_cell_list_contents(pos)
+            if any(isinstance(agent, Fire) for agent in contents):
+                return True
+
+        path_smoke_risk = sum(1 for pos in current_path if self.model.smoke_level_map.get(pos, 0) > 0)
+        if path_smoke_risk >= max(1, len(current_path) // 2):
+            return True
+
+        return False
 
     def perform_action(self):
         agent, _ = self.planned_target
@@ -905,8 +950,8 @@ class Human(Agent):
 
     def move_toward_target(self):
         next_location: Coordinate = None
-        pruned_edges = set()
-        graph = deepcopy(self.model.graph)
+        blocked_nodes = set()
+        graph = self.model.graph
 
         self.update_target()  # Get the latest location of a target, if it still exists
         if self.planned_action:  # And if there's an action, check if it's still possible
@@ -915,10 +960,12 @@ class Human(Agent):
         while self.planned_target[1] and not next_location:
             if self.location_is_traversable(self.planned_target[1]):
                 # Target is traversable
-                path = self.get_path(graph, self.planned_target[1])
+                planning_graph = graph.subgraph([n for n in graph.nodes if n not in blocked_nodes]).copy()
+                path = self.get_path(planning_graph, self.planned_target[1])
             else:
                 # Target is not traversable (e.g. we are going to another Human), so don't include target in the path
-                path = self.get_path(graph, self.planned_target[1], include_target=False)
+                planning_graph = graph.subgraph([n for n in graph.nodes if n not in blocked_nodes]).copy()
+                path = self.get_path(planning_graph, self.planned_target[1], include_target=False)
 
             if len(path) > 0:
                 next_location, next_path = self.get_next_location(path)
@@ -994,9 +1041,7 @@ class Human(Agent):
                         continue
 
                     # Remove the next location from the temporary graph so we can try pathing again without it
-                    edges = graph.edges(next_location)
-                    pruned_edges.update(edges)
-                    graph.remove_node(next_location)
+                    blocked_nodes.add(next_location)
 
                     # Reset planned_target if the next location was the end of the path
                     if next_location == path[-1]:
@@ -1012,10 +1057,6 @@ class Human(Agent):
                 self.planned_action = None
                 break
 
-        if len(pruned_edges) > 0:
-            # Add back the edges we removed when removing any non-traversable nodes from the global graph, because they may be traversable again next step
-            graph.add_edges_from(list(pruned_edges))
-
     def step(self):
         if not self.escaped and self.pos:
             self.health_mobility_rules()
@@ -1025,6 +1066,7 @@ class Human(Agent):
                 return
 
             self.visible_tiles = self.get_visible_tiles()
+            self.smoke_exposure += self.model.smoke_level_map.get(self.pos, 0.0)
 
             self.panic_rules()
 
@@ -1036,6 +1078,12 @@ class Human(Agent):
             if self.model.fire_started and self.believes_alarm:
                 if not isinstance(planned_target_agent, FireExit) and not self.planned_action:
                     self.attempt_exit_plan()
+                elif isinstance(planned_target_agent, FireExit) and self.should_replan(self.last_path):
+                    previous_target = self.planned_target
+                    self.attempt_exit_plan()
+                    if self.planned_target != previous_target:
+                        self.path_change_count += 1
+                    self.last_replan_step = self.model.schedule.steps
 
                 # Check if anything in vision can be collaborated with, if the agent has normal mobility
                 if self.mobility == Human.Mobility.NORMAL and self.collaborates:
@@ -1061,6 +1109,8 @@ class Human(Agent):
                 #     self.get_random_target()
 
             self.move_toward_target()
+            if self.planned_target[1]:
+                self.last_path = self.get_path(self.model.graph, self.planned_target[1])
 
             # Agent reached a fire escape, proceed to exit
             if self.model.fire_started and self.pos in self.model.fire_exits.keys():
@@ -1070,6 +1120,7 @@ class Human(Agent):
                     self.model.grid.remove_agent(carried_agent)
 
                 self.escaped = True
+                self.evacuation_time = self.model.schedule.steps
                 self.model.grid.remove_agent(self)
 
     def get_status(self):

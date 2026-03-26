@@ -5,7 +5,7 @@ from mesa.visualization.ModularVisualization import ModularServer
 from mesa.visualization.UserParam import UserSettableParameter
 
 from .model import FireEvacuation
-from .agent import FireExit, Wall, Furniture, Fire, Smoke, Human, Sight, Door, DeadHuman
+from .agent import DeadHuman, Door, Fire, FireExit, Furniture, GuideSignal, Human, Sight, Smoke, Wall
 
 
 # Creates a visual portrayal of our model in the browser interface
@@ -67,6 +67,18 @@ def fire_evacuation_portrayal(agent):
         portrayal["Shape"] = "fire_evacuation/resources/eye.png"
         portrayal["scale"] = 0.8
         portrayal["Layer"] = 7
+    elif type(agent) is GuideSignal:
+        risk = min(1.0, agent.local_risk / 8.0)
+        red = int(255 * risk)
+        green = int(255 * (1 - risk))
+        portrayal["Shape"] = "rect"
+        portrayal["Color"] = f"rgba({red}, {green}, 0, 0.25)"
+        portrayal["Filled"] = "true"
+        portrayal["w"] = 1
+        portrayal["h"] = 1
+        portrayal["text"] = agent.direction
+        portrayal["text_color"] = "#111111"
+        portrayal["Layer"] = 0
 
     return portrayal
 
@@ -99,6 +111,14 @@ collaboration_chart = ChartModule(
     ]
 )
 
+risk_chart = ChartModule(
+    [
+        {"Label": "Avg Smoke Exposure", "Color": "gray"},
+        {"Label": "Max Exit Congestion", "Color": "purple"},
+        {"Label": "Avg Path Changes", "Color": "orange"},
+    ]
+)
+
 # Get list of available floorplans
 floor_plans = [
     f
@@ -123,12 +143,21 @@ model_params = {
     ),
     "visualise_vision": UserSettableParameter("checkbox", "Show Agent Vision", value=False),
     "save_plots": UserSettableParameter("checkbox", "Save plots to file", value=True),
+    "guidance_mode": UserSettableParameter(
+        "choice", "Guidance Mode", value="dynamic", choices=["static", "dynamic"]
+    ),
+    "replan_interval": UserSettableParameter(
+        "slider", "Replan Interval", value=3, min_value=1, max_value=10, step=1
+    ),
+    "use_prediction": UserSettableParameter(
+        "checkbox", "Predictive Smoke Guidance", value=False
+    ),
 }
 
 # Start the visual server with the model
 server = ModularServer(
     FireEvacuation,
-    [canvas_element, status_chart, mobility_chart, collaboration_chart],
+    [canvas_element, status_chart, mobility_chart, collaboration_chart, risk_chart],
     "Fire Evacuation",
     model_params,
 )
